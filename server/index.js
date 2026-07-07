@@ -1,5 +1,13 @@
+// Load server/.env if present (Node 21+ built-in; silently skipped if absent).
+try {
+  process.loadEnvFile(new URL('./.env', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+} catch {
+  /* no .env — fine, deterministic engine runs */
+}
+
 import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
+import { elevenConfigured, ttsStream, stt } from './voice.js';
 import {
   getOrCreateSession,
   recordConsent,
@@ -13,7 +21,7 @@ import {
   db,
 } from './db.js';
 import { isCrisisText, isCrisisRisk, CRISIS_REPLY } from './safety.js';
-import { llmConfigured, llmTurn, fallbackTurn, MODEL } from './engine.js';
+import { llmConfigured, llmProvider, llmTurn, fallbackTurn, MODEL } from './engine.js';
 
 const app = express();
 app.use(express.json({ limit: '32kb' }));
@@ -21,11 +29,42 @@ app.use(express.json({ limit: '32kb' }));
 const PORT = Number(process.env.RAAHA_SERVER_PORT || process.env.PORT || 8787);
 
 app.get('/api/health', (_req, res) => {
+  const provider = llmProvider();
   res.json({
     ok: true,
-    engine: llmConfigured() ? 'llm' : 'deterministic',
-    model: llmConfigured() ? MODEL : null,
+    engine: provider ? 'llm' : 'deterministic',
+    provider,
+    model: provider === 'anthropic' ? MODEL : provider === 'openrouter' ? (process.env.RAAHA_OPENROUTER_MODEL || 'openrouter/auto') : null,
+    voice: elevenConfigured() ? 'elevenlabs' : 'browser',
   });
+});
+
+// ---- ElevenLabs voice proxy (key never reaches the browser) ----
+app.post('/api/tts', async (req, res) => {
+  if (!elevenConfigured()) return res.status(503).json({ error: 'voice not configured' });
+  const text = String(req.body?.text ?? '').trim();
+  if (!text) return res.status(400).json({ error: 'text required' });
+  try {
+    const upstream = await ttsStream(text);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    res.end(buf);
+  } catch (err) {
+    console.error('[tts]', err.message);
+    res.status(502).json({ error: 'tts failed' });
+  }
+});
+
+app.post('/api/stt', express.raw({ type: ['audio/*'], limit: '8mb' }), async (req, res) => {
+  if (!elevenConfigured()) return res.status(503).json({ error: 'voice not configured' });
+  if (!req.body?.length) return res.status(400).json({ error: 'audio body required' });
+  try {
+    const result = await stt(req.body, req.headers['content-type'] || 'audio/webm');
+    res.json(result);
+  } catch (err) {
+    console.error('[stt]', err.message);
+    res.status(502).json({ error: 'stt failed' });
+  }
 });
 
 app.post('/api/consent', (req, res) => {
@@ -59,11 +98,15 @@ app.post('/api/chat', async (req, res) => {
     try {
       turn = await llmTurn(recentMessages(sessionId), text);
     } catch (err) {
-      if (err instanceof Anthropic.AuthenticationError) {
-        audit(sessionId, 'llm.auth_failed_falling_back');
-        turn = fallbackTurn(sessionId, text);
-      } else if (err instanceof Anthropic.RateLimitError || (err instanceof Anthropic.APIError && err.status >= 500)) {
-        audit(sessionId, 'llm.unavailable_falling_back', { status: err.status });
+      const status = err?.status ?? 0;
+      const recoverable =
+        err instanceof Anthropic.AuthenticationError ||
+        err instanceof Anthropic.RateLimitError ||
+        (err instanceof Anthropic.APIError && status >= 500) ||
+        // OpenRouter path throws plain errors with .status
+        status === 401 || status === 402 || status === 403 || status === 429 || status >= 500;
+      if (recoverable) {
+        audit(sessionId, 'llm.falling_back', { status, message: String(err.message).slice(0, 200) });
         turn = fallbackTurn(sessionId, text);
       } else {
         throw err;

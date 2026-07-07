@@ -42,3 +42,24 @@ export async function ackIncident(id) {
   if (!res.ok) throw new Error(`ack failed: ${res.status}`);
   return res.json();
 }
+
+// ElevenLabs proxied voice. Returns an object URL for an <audio>/Audio() play.
+export async function ttsAudioUrl(text) {
+  const res = await fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new Error(`tts failed: ${res.status}`);
+  return URL.createObjectURL(await res.blob());
+}
+
+export async function sttTranscribe(blob) {
+  const res = await fetch('/api/stt', {
+    method: 'POST',
+    headers: { 'Content-Type': blob.type || 'audio/webm' },
+    body: blob,
+  });
+  if (!res.ok) throw new Error(`stt failed: ${res.status}`);
+  return res.json(); // { text, language }
+}

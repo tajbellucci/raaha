@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Mic, Send, Loader2, Volume2, VolumeX } from 'lucide-react';
 import { SCENARIOS, CRISIS_KEYWORDS, CRISIS_TURN, FALLBACK_TURN } from './scenarios.js';
-import { sendChat } from './api.js';
-import { useSpeechInput, sttSupported, speak } from './useVoice.js';
+import { sendChat, ttsAudioUrl, sttTranscribe } from './api.js';
+import { useSpeechInput, sttSupported, speak, recorderSupported, recordClip } from './useVoice.js';
 
 const AGENT_LABELS = {
   intake_triage: 'Intake & Triage Agent',
@@ -84,6 +84,50 @@ export default function EmployeeChat({ backend }) {
     void submitText(text);
   });
 
+  const elVoice = live && backend.voice === 'elevenlabs';
+  const [recording, setRecording] = useState(null); // { stop } while mic is capturing
+
+  async function speakReply(reply, language) {
+    if (!ttsOn) return;
+    if (elVoice) {
+      try {
+        const url = await ttsAudioUrl(reply);
+        const audio = new Audio(url);
+        audio.onended = () => URL.revokeObjectURL(url);
+        await audio.play();
+        return;
+      } catch {
+        /* fall through to browser voice */
+      }
+    }
+    speak(reply, language);
+  }
+
+  async function micPressed() {
+    // ElevenLabs Scribe path: record → server STT → send. Otherwise Web Speech.
+    if (elVoice && recorderSupported()) {
+      if (recording) {
+        recording.stop();
+        return;
+      }
+      try {
+        const rec = await recordClip(8000);
+        setRecording(rec);
+        const blob = await rec.blob;
+        setRecording(null);
+        const { text } = await sttTranscribe(blob);
+        if (text?.trim()) {
+          setInput(text);
+          void submitText(text);
+        }
+      } catch {
+        setRecording(null);
+      }
+      return;
+    }
+    startListening('en');
+  }
+
   // ---------- live backend path ----------
   async function liveSend(text, display) {
     setBusy(true);
@@ -95,7 +139,7 @@ export default function EmployeeChat({ backend }) {
     try {
       const turn = normalizeTurn(await sendChat(sessionIdRef.current, text));
       setMessages((m) => [...m.slice(0, -1), { kind: 'agent', turn }]);
-      if (ttsOn) speak(turn.reply, turn.language);
+      void speakReply(turn.reply, turn.language);
     } catch {
       setMessages((m) => [
         ...m.slice(0, -1),
@@ -231,15 +275,17 @@ export default function EmployeeChat({ backend }) {
         </div>
 
         <div className="flex items-center gap-2 px-4 py-3 border-t border-ink/10">
-          {sttSupported() && (
+          {(sttSupported() || (elVoice && recorderSupported())) && (
             <button
-              onClick={() => (listening ? null : startListening('en'))}
+              onClick={micPressed}
               disabled={busy}
               className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 transition-colors ${
-                listening ? 'bg-maroon text-ivory animate-pulse' : 'bg-ivory border border-ink/10 text-ink-soft hover:text-maroon'
+                listening || recording
+                  ? 'bg-maroon text-ivory animate-pulse'
+                  : 'bg-ivory border border-ink/10 text-ink-soft hover:text-maroon'
               }`}
               aria-label="Speak your message"
-              title="Speak your message"
+              title={recording ? 'Tap to stop recording' : 'Speak your message'}
             >
               <Mic className="w-4 h-4" />
             </button>

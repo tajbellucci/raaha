@@ -55,3 +55,25 @@ export function speak(text, lang = 'en') {
   u.rate = 0.95;
   window.speechSynthesis.speak(u);
 }
+
+// MediaRecorder-based mic capture for server-side (ElevenLabs Scribe) STT.
+export function recorderSupported() {
+  return typeof window !== 'undefined' && 'MediaRecorder' in window && navigator.mediaDevices?.getUserMedia;
+}
+
+export async function recordClip(maxMs = 8000) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const rec = new MediaRecorder(stream);
+  const chunks = [];
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const done = new Promise((resolve) => {
+    rec.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      resolve(new Blob(chunks, { type: rec.mimeType || 'audio/webm' }));
+    };
+  });
+  rec.start();
+  const stop = () => rec.state !== 'inactive' && rec.stop();
+  setTimeout(stop, maxMs);
+  return { stop, blob: done };
+}

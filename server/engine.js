@@ -58,8 +58,14 @@ function getClient() {
   return client;
 }
 
+export function llmProvider() {
+  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) return 'anthropic';
+  if (process.env.OPENROUTER_API_KEY) return 'openrouter';
+  return null;
+}
+
 export function llmConfigured() {
-  return Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
+  return llmProvider() !== null;
 }
 
 export async function llmTurn(history, userText) {
@@ -75,6 +81,10 @@ export async function llmTurn(history, userText) {
     })),
     { role: 'user', content: userText },
   ];
+
+  if (llmProvider() === 'openrouter') {
+    return openRouterTurn(SYSTEM_PROMPT + contextNote, messages);
+  }
 
   const response = await getClient().messages.create({
     model: MODEL,
@@ -100,6 +110,59 @@ export async function llmTurn(history, userText) {
   const text = response.content.find((b) => b.type === 'text')?.text ?? '{}';
   const parsed = JSON.parse(text); // structured outputs guarantee schema-valid JSON
   return { ...parsed, engine: 'llm' };
+}
+
+// OpenRouter path (OpenAI-compatible wire format, per Taj's explicit request).
+// response_format json_schema is honored by most routed models; if a provider
+// ignores it we salvage the first JSON object from the text.
+async function openRouterTurn(system, messages) {
+  const model = process.env.RAAHA_OPENROUTER_MODEL || 'openrouter/auto';
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://tajbellucci.github.io/raaha/',
+      'X-Title': 'Raaha prototype',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 2048,
+      messages: [{ role: 'system', content: system }, ...messages],
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name: 'triage', strict: true, schema: TRIAGE_SCHEMA },
+      },
+    }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    const err = new Error(`openrouter ${res.status}: ${detail.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  const raw = data.choices?.[0]?.message?.content ?? '{}';
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    const m = raw.match(/\{[\s\S]*\}/);
+    parsed = m ? JSON.parse(m[0]) : null;
+  }
+  if (!parsed?.reply) {
+    return {
+      agent: 'navigator',
+      risk: 'moderate',
+      topic: 'other',
+      language: 'en',
+      reply:
+        'I want to make sure you get the right kind of help. Let me connect you with a human navigator.',
+      action: 'Navigator callback offered · model returned unusable output',
+      engine: `openrouter:${model}`,
+    };
+  }
+  return { ...parsed, engine: `openrouter:${data.model || model}` };
 }
 
 // ---------------- Deterministic fallback path ----------------
