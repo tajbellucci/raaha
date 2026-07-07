@@ -1,4 +1,6 @@
+import { useEffect, useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
+import { fetchInsights } from './api.js';
 
 // All figures below are illustrative demo data — not from a real deployment.
 const LANGUAGES = [
@@ -41,7 +43,93 @@ function Bar({ label, value, color, suffix = '%' }) {
   );
 }
 
-export default function HRDashboard() {
+const LANG_NAMES = { ur: 'Urdu · Hindi', ar: 'Arabic', en: 'English', ml: 'Malayalam', tl: 'Tagalog' };
+const LANG_COLORS = ['bg-maroon', 'bg-oasis', 'bg-gold', 'bg-ink-soft', 'bg-dune'];
+const RISK_COLORS = { low: 'bg-oasis', moderate: 'bg-gold', high: 'bg-maroon-deep', emergency: 'bg-maroon' };
+
+function LiveDashboard({ data }) {
+  const pct = (rows) => {
+    const total = rows.reduce((a, r) => a + r.n, 0) || 1;
+    return rows.map((r) => ({ ...r, value: Math.round((r.n / total) * 100) }));
+  };
+  const langs = pct(data.by_language);
+  const risks = pct(data.by_risk);
+  const topics = pct(data.by_topic);
+
+  return (
+    <div>
+      <div className="flex items-center gap-2.5 rounded-xl bg-oasis-soft border border-oasis/20 px-4 py-3 mb-6">
+        <ShieldCheck className="w-4.5 h-4.5 text-oasis shrink-0" />
+        <p className="text-sm text-ink-soft">
+          Live aggregates from the prototype database (k-anonymity floor: {data.k_floor} — smaller
+          cells are suppressed server-side). This endpoint has no access to conversation text.
+        </p>
+      </div>
+
+      <div className="grid sm:grid-cols-3 gap-4 mb-6">
+        {[
+          [String(data.total_sessions), 'sessions recorded'],
+          [String(data.open_incidents), 'open incidents in navigator queue'],
+          [`k≥${data.k_floor}`, 'anonymity floor, enforced in the data layer'],
+        ].map(([num, label]) => (
+          <div key={label} className="rounded-2xl bg-white border border-ink/10 p-5">
+            <p className="font-display text-3xl text-maroon">{num}</p>
+            <p className="text-sm text-ink-soft mt-1">{label}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-5">
+        <div className="rounded-2xl bg-white border border-ink/10 p-6">
+          <p className="font-semibold mb-4">Sessions by language</p>
+          <div className="flex flex-col gap-3.5">
+            {langs.map((l, i) => (
+              <Bar key={l.label} label={LANG_NAMES[l.label] || l.label} value={l.value} color={LANG_COLORS[i % LANG_COLORS.length]} />
+            ))}
+          </div>
+        </div>
+        <div className="rounded-2xl bg-white border border-ink/10 p-6">
+          <p className="font-semibold mb-4">Risk-level distribution</p>
+          <div className="flex flex-col gap-3.5">
+            {risks.map((r) => (
+              <Bar key={r.label} label={r.label} value={r.value} color={RISK_COLORS[r.label] || 'bg-ink-soft'} />
+            ))}
+          </div>
+          <p className="text-xs text-ink-soft italic mt-4">
+            High/emergency conversations open incidents handled by human navigators — this aggregate
+            view is the only signal that reaches HR.
+          </p>
+        </div>
+        <div className="rounded-2xl bg-white border border-ink/10 p-6 lg:col-span-2">
+          <p className="font-semibold mb-4">Themes</p>
+          <div className="flex flex-col gap-3.5">
+            {topics.map((t) => (
+              <Bar key={t.label} label={t.label} value={t.value} color="bg-maroon" />
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function HRDashboard({ live = false }) {
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    if (!live) return;
+    let on = true;
+    const load = () => fetchInsights().then((d) => on && setData(d)).catch(() => {});
+    load();
+    const t = setInterval(load, 5000);
+    return () => {
+      on = false;
+      clearInterval(t);
+    };
+  }, [live]);
+
+  if (live && data) return <LiveDashboard data={data} />;
+
   const maxTrend = Math.max(...TREND);
   return (
     <div>

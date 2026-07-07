@@ -1,9 +1,36 @@
 import { useEffect, useRef, useState } from 'react';
-import { Mic, Send, Loader2 } from 'lucide-react';
+import { Mic, Send, Loader2, Volume2, VolumeX } from 'lucide-react';
 import { SCENARIOS, CRISIS_KEYWORDS, CRISIS_TURN, FALLBACK_TURN } from './scenarios.js';
+import { sendChat } from './api.js';
+import { useSpeechInput, sttSupported, speak } from './useVoice.js';
 
+const AGENT_LABELS = {
+  intake_triage: 'Intake & Triage Agent',
+  psychoeducation: 'Psychoeducation Agent',
+  navigator: 'Navigator Agent',
+  escalation_safety: 'Escalation & Safety Agent',
+};
+const AGENT_COLORS = {
+  'Intake & Triage Agent': 'gold',
+  'Psychoeducation Agent': 'oasis',
+  'Navigator Agent': 'maroon',
+  'Escalation & Safety Agent': 'maroon',
+};
 const AGENT_DOT = { gold: 'bg-gold', oasis: 'bg-oasis', maroon: 'bg-maroon' };
 const AGENT_TEXT = { gold: 'text-gold', oasis: 'text-oasis', maroon: 'text-maroon' };
+
+function normalizeTurn(turn) {
+  // Backend turns use snake_case agent ids; scripted turns already carry labels.
+  const label = AGENT_LABELS[turn.agent] || turn.agent;
+  return {
+    agent: label,
+    agentColor: turn.agentColor || AGENT_COLORS[label] || 'oasis',
+    risk: turn.risk,
+    reply: turn.reply,
+    action: turn.action ?? null,
+    language: turn.language || 'en',
+  };
+}
 
 function AgentBubble({ turn }) {
   return (
@@ -14,7 +41,7 @@ function AgentBubble({ turn }) {
       </span>
       <div
         className={`rounded-2xl rounded-bl-sm border px-4 py-3 text-[0.92rem] leading-relaxed ${
-          turn.risk === 'emergency'
+          turn.risk === 'emergency' || turn.risk === 'high'
             ? 'bg-maroon/5 border-maroon/30 text-ink'
             : 'bg-white border-ink/10 text-ink'
         }`}
@@ -39,57 +66,101 @@ function TypingIndicator({ label }) {
   );
 }
 
-export default function EmployeeChat() {
-  const [messages, setMessages] = useState([]); // { kind: 'user'|'agent'|'typing', ... }
+export default function EmployeeChat({ backend }) {
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [ttsOn, setTtsOn] = useState(false);
   const scrollRef = useRef(null);
+  const sessionIdRef = useRef(`web-${Math.random().toString(36).slice(2, 10)}`);
+  const live = Boolean(backend);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
+  const { listening, start: startListening } = useSpeechInput((text) => {
+    setInput(text);
+    void submitText(text);
+  });
+
+  // ---------- live backend path ----------
+  async function liveSend(text, display) {
+    setBusy(true);
+    setMessages((m) => [
+      ...m,
+      { kind: 'user', ...display },
+      { kind: 'typing', label: 'Raaha is thinking…' },
+    ]);
+    try {
+      const turn = normalizeTurn(await sendChat(sessionIdRef.current, text));
+      setMessages((m) => [...m.slice(0, -1), { kind: 'agent', turn }]);
+      if (ttsOn) speak(turn.reply, turn.language);
+    } catch {
+      setMessages((m) => [
+        ...m.slice(0, -1),
+        {
+          kind: 'agent',
+          turn: normalizeTurn({
+            agent: 'navigator',
+            risk: 'low',
+            reply: 'Connection hiccup — please try that again.',
+            action: null,
+          }),
+        },
+      ]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // ---------- scripted fallback path (static deploy) ----------
   function matchScenario(text) {
     const lower = text.toLowerCase();
     if (CRISIS_KEYWORDS.some((k) => lower.includes(k.toLowerCase()) || text.includes(k))) {
       return { turns: [CRISIS_TURN] };
     }
     const hit = SCENARIOS.find((s) => s.keywords.some((k) => lower.includes(k.toLowerCase()) || text.includes(k)));
-    return hit ? hit : { turns: [FALLBACK_TURN] };
+    return hit ?? { turns: [FALLBACK_TURN] };
   }
 
-  async function playTurns(turns, userDir = 'ltr') {
+  async function scriptedPlay(turns) {
     setBusy(true);
     for (const turn of turns) {
       setMessages((m) => [...m, { kind: 'typing', label: `${turn.agent} is responding…` }]);
       await new Promise((r) => setTimeout(r, 700 + Math.random() * 400));
-      setMessages((m) => [...m.slice(0, -1), { kind: 'agent', turn, dir: userDir }]);
+      setMessages((m) => [...m.slice(0, -1), { kind: 'agent', turn }]);
       await new Promise((r) => setTimeout(r, 250));
     }
     setBusy(false);
   }
 
-  function sendScenario(scenario) {
-    if (busy) return;
-    setMessages((m) => [
-      ...m,
-      { kind: 'user', text: scenario.userText, translation: scenario.userTranslation, dir: scenario.dir, lang: scenario.lang },
-    ]);
-    playTurns(scenario.turns, scenario.dir);
-  }
-
-  function sendFreeText() {
-    const text = input.trim();
+  // ---------- unified entry points ----------
+  async function submitText(raw) {
+    const text = raw.trim();
     if (!text || busy) return;
     setInput('');
-    setMessages((m) => [...m, { kind: 'user', text, dir: 'ltr', lang: 'en' }]);
-    const scenario = matchScenario(text);
-    playTurns(scenario.turns, 'ltr');
+    const display = { text, dir: 'ltr', lang: 'en' };
+    if (live) return liveSend(text, display);
+    setMessages((m) => [...m, { kind: 'user', ...display }]);
+    await scriptedPlay(matchScenario(text).turns);
+  }
+
+  async function sendScenario(scenario) {
+    if (busy) return;
+    const display = {
+      text: scenario.userText,
+      translation: scenario.userTranslation,
+      dir: scenario.dir,
+      lang: scenario.lang,
+    };
+    if (live) return liveSend(scenario.userText, display);
+    setMessages((m) => [...m, { kind: 'user', ...display }]);
+    await scriptedPlay(scenario.turns);
   }
 
   return (
     <div className="grid lg:grid-cols-[280px_1fr] gap-5">
-      {/* scenario picker */}
       <div className="flex lg:flex-col gap-2.5 overflow-x-auto lg:overflow-visible pb-2 lg:pb-0">
         <p className="hidden lg:block text-xs font-semibold uppercase tracking-wide text-ink-soft mb-1">
           Try a scenario
@@ -105,29 +176,42 @@ export default function EmployeeChat() {
           </button>
         ))}
         <p className="hidden lg:block text-xs text-ink-soft leading-relaxed mt-2">
-          Or type your own message below — the demo also recognizes crisis language and always
-          routes it to the Escalation &amp; Safety Agent with real helpline numbers, never an
-          autonomous reply.
+          {live
+            ? 'Live prototype: every message runs through the real orchestrator, risk pipeline, and database. Crisis language always routes to the Escalation & Safety protocol with real helpline numbers.'
+            : 'Scripted demo (no backend on this deploy). Crisis language still always routes to the Escalation & Safety Agent with real helpline numbers.'}
         </p>
       </div>
 
-      {/* chat window */}
       <div className="rounded-2xl bg-white border border-ink/10 shadow-[0_16px_44px_-28px_rgba(30,43,43,0.5)] flex flex-col h-[32rem]">
         <div className="flex items-center gap-2.5 px-5 py-4 border-b border-ink/10">
           <span className="w-9 h-9 rounded-full bg-oasis-soft flex items-center justify-center">
             <Mic className="w-4 h-4 text-oasis" />
           </span>
-          <div>
+          <div className="flex-1">
             <p className="text-sm font-semibold">Raaha assistant</p>
-            <p className="text-xs text-ink-soft">WhatsApp · confidential · illustrative demo</p>
+            <p className="text-xs text-ink-soft">
+              {live
+                ? backend.engine === 'llm'
+                  ? `Live · agentic (${backend.model})`
+                  : 'Live · deterministic engine (no LLM key set)'
+                : 'WhatsApp · confidential · scripted demo'}
+            </p>
           </div>
+          <button
+            onClick={() => setTtsOn((v) => !v)}
+            className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${ttsOn ? 'bg-oasis text-ivory' : 'bg-ivory text-ink-soft hover:text-ink'}`}
+            aria-label="Toggle spoken replies"
+            title="Speak replies aloud"
+          >
+            {ttsOn ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+          </button>
         </div>
 
         <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
           {messages.length === 0 && (
             <p className="text-ink-soft text-sm italic m-auto text-center max-w-xs">
-              Pick a scenario on the left, or type a message below, to see the orchestrator route
-              it to the right agent.
+              Pick a scenario, type, or use the mic — the orchestrator routes every message to the
+              right agent.
             </p>
           )}
           {messages.map((m, i) => {
@@ -147,16 +231,29 @@ export default function EmployeeChat() {
         </div>
 
         <div className="flex items-center gap-2 px-4 py-3 border-t border-ink/10">
+          {sttSupported() && (
+            <button
+              onClick={() => (listening ? null : startListening('en'))}
+              disabled={busy}
+              className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 transition-colors ${
+                listening ? 'bg-maroon text-ivory animate-pulse' : 'bg-ivory border border-ink/10 text-ink-soft hover:text-maroon'
+              }`}
+              aria-label="Speak your message"
+              title="Speak your message"
+            >
+              <Mic className="w-4 h-4" />
+            </button>
+          )}
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && sendFreeText()}
-            placeholder="Type a message…"
+            onKeyDown={(e) => e.key === 'Enter' && submitText(input)}
+            placeholder={listening ? 'Listening…' : 'Type a message…'}
             disabled={busy}
             className="flex-1 rounded-full bg-ivory border border-ink/10 px-4 py-2.5 text-sm outline-none focus:border-oasis/50 disabled:opacity-60"
           />
           <button
-            onClick={sendFreeText}
+            onClick={() => submitText(input)}
             disabled={busy || !input.trim()}
             className="w-10 h-10 rounded-full bg-maroon hover:bg-maroon-deep disabled:opacity-40 text-ivory flex items-center justify-center shrink-0 transition-colors"
             aria-label="Send"

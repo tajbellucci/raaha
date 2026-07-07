@@ -25,3 +25,6 @@ dist-ssr
 
 # Harness/editor config — not part of the site
 .claude/
+
+# Prototype server local data
+server/data/
