@@ -10,6 +10,7 @@ import Pilot from './components/Pilot.jsx';
 import Privacy from './components/Privacy.jsx';
 import Footer from './components/Footer.jsx';
 import Demo from './demo/Demo.jsx';
+import FrontOffice from './frontoffice/FrontOffice.jsx';
 
 function useHashRoute() {
   const [hash, setHash] = useState(() => window.location.hash);
@@ -59,7 +60,9 @@ function Landing() {
 
 function App() {
   const hash = useHashRoute();
-  return hash === '#demo' ? <Demo /> : <Landing />;
+  if (hash === '#demo') return <Demo />;
+  if (hash === '#business') return <FrontOffice />;
+  return <Landing />;
 }
 
 export default App;
